@@ -16,12 +16,15 @@ function setup() {
   export GIT_SSH_COMMAND="$git_ssh_cmd"
   # shellcheck disable=SC2154
   git_port_forward_pid="${git_srv_result[1]}"
-  install_flux_with_fluxctl
+  install_flux_with_fluxctl "13_sync_gc"
 }
 
-@test "Basic sync test" {
-  # Wait until flux deploys the workloads
+@test "Sync with garbage collection test" {
+  # Wait until flux deploys the workloads, which indicates it has at least started a sync
   poll_until_true 'workload podinfo' 'kubectl -n demo describe deployment/podinfo'
+
+  # make sure we have _finished_ a sync run
+  fluxctl --k8s-fwd-ns "${FLUX_NAMESPACE}" sync
 
   # Clone the repo and check the sync tag
   local clone_dir
@@ -34,24 +37,23 @@ function setup() {
   head_hash=$(git rev-list -n 1 HEAD)
   [ "$sync_tag_hash" = "$head_hash" ]
 
-  # Add a change, wait for it to happen and check the sync tag again
-  sed -i'.bak' 's%stefanprodan/podinfo:2.1.0%stefanprodan/podinfo:3.1.5%' "${clone_dir}/workloads/podinfo-dep.yaml"
-  git -c 'user.email=foo@bar.com' -c 'user.name=Foo' commit -am "Bump podinfo"
+  # Remove a manifest and commit that
+  git rm workloads/podinfo-dep.yaml
+  git -c 'user.email=foo@bar.com' -c 'user.name=Foo' commit -m "Remove podinfo deployment"
   head_hash=$(git rev-list -n 1 HEAD)
   git push >&3
-  poll_until_equals "podinfo image" "stefanprodan/podinfo:3.1.5" "kubectl get pod -n demo -l app=podinfo -o\"jsonpath={['items'][0]['spec']['containers'][0]['image']}\""
-  git pull -f --tags
+
+  fluxctl --k8s-fwd-ns "${FLUX_NAMESPACE}" sync
+
+  poll_until_equals "podinfo deployment removed" "[]" "kubectl get deploy -n demo -o\"jsonpath={['items']}\""
+  git pull -f --tags >&3
   sync_tag_hash=$(git rev-list -n 1 flux)
   [ "$sync_tag_hash" = "$head_hash" ]
 }
 
 function teardown() {
-  # Teardown the created port-forward to gitsrv and restore Git settings.
   kill "$git_port_forward_pid"
-  unset GIT_SSH_COMMAND
-  # Uninstall Flux and the global resources it installs.
-  uninstall_flux_with_fluxctl
-  # Removing the namespace also takes care of removing gitsrv.
+  # Removing the namespace also takes care of removing Flux and gitsrv.
   kubectl delete namespace "$FLUX_NAMESPACE"
   # Only remove the demo workloads after Flux, so that they cannot be recreated.
   kubectl delete namespace "$DEMO_NAMESPACE"
