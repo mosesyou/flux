@@ -418,6 +418,7 @@ func (r *Repo) Start(shutdown <-chan struct{}, done *sync.WaitGroup) error {
 			continue
 		}
 	}
+	return nil
 }
 
 func (r *Repo) Refresh(ctx context.Context) error {
