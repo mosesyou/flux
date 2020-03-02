@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"github.com/ryanuber/go-glob"
 	"io"
 	"os/exec"
 	"sort"
@@ -22,7 +23,6 @@ import (
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 
 	"github.com/fluxcd/flux/pkg/cluster"
@@ -202,27 +202,62 @@ func (r *kuberesource) GetGCMark() string {
 	return r.obj.GetLabels()[gcMarkLabel]
 }
 
+func (c *Cluster) filterResources(resources *meta_v1.APIResourceList) *meta_v1.APIResourceList {
+	list := []meta_v1.APIResource{}
+	for _, apiResource := range resources.APIResources {
+		fullName := fmt.Sprintf("%s/%s", resources.GroupVersion, apiResource.Kind)
+		excluded := false
+		for _, exp := range c.resourceExcludeList {
+			if glob.Glob(exp, fullName) {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			list = append(list, apiResource)
+		}
+	}
+
+	return &meta_v1.APIResourceList{
+		TypeMeta:     resources.TypeMeta,
+		GroupVersion: resources.GroupVersion,
+		APIResources: list,
+	}
+}
+
 func (c *Cluster) getAllowedResourcesBySelector(selector string) (map[string]*kuberesource, error) {
 	listOptions := meta_v1.ListOptions{}
 	if selector != "" {
 		listOptions.LabelSelector = selector
 	}
 
-	_, resources, err := c.client.discoveryClient.ServerGroupsAndResources()
-	if err != nil {
-		discErr, ok := err.(*discovery.ErrGroupDiscoveryFailed)
-		if !ok {
-			return nil, err
-		}
-		for gv, e := range discErr.Groups {
-			if gv.Group == "metrics" || strings.HasSuffix(gv.Group, "metrics.k8s.io") {
-				// The Metrics API tends to be misconfigured, causing errors.
-				// We just ignore them, since it doesn't make sense to sync metrics anyways.
-				continue
+	sgs, err := c.client.discoveryClient.ServerGroups()
+	if sgs == nil {
+		return nil, err
+	}
+
+	resources := []*meta_v1.APIResourceList{}
+	for i := range sgs.Groups {
+		gv := sgs.Groups[i].PreferredVersion.GroupVersion
+
+		excluded := false
+		for _, exp := range c.resourceExcludeList {
+			if glob.Glob(exp, fmt.Sprintf("%s/", gv)) {
+				excluded = true
+				break
 			}
-			// Tolerate empty GroupVersions due to e.g. misconfigured custom metrics
-			if e.Error() != fmt.Sprintf("Got empty response for: %v", gv) {
-				return nil, err
+		}
+
+		if !excluded {
+			if r, err := c.client.discoveryClient.ServerResourcesForGroupVersion(gv); err == nil {
+				if r != nil {
+					resources = append(resources, c.filterResources(r))
+				}
+			} else {
+				// ignore errors for resources with empty group version instead of failing to sync
+				if err.Error() != fmt.Sprintf("Got empty response for: %v", gv) {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -268,7 +303,12 @@ func (c *Cluster) getAllowedResourcesBySelector(selector string) (map[string]*ku
 				if itemDesc == "v1:ComponentStatus" || itemDesc == "v1:Endpoints" {
 					continue
 				}
-				// TODO(michael) also exclude anything that has an ownerReference (that isn't "standard"?)
+
+				// exclude anything that has an ownerReference
+				owners := item.GetOwnerReferences()
+				if owners != nil && len(owners) > 0 {
+					continue
+				}
 
 				res := &kuberesource{obj: &list[i], namespaced: apiResource.Namespaced}
 				result[res.ResourceID().String()] = res
@@ -335,6 +375,15 @@ func applyMetadata(res resource.Resource, syncSetName, checksum string) ([]byte,
 		mixinLabels := map[string]string{}
 		mixinLabels[gcMarkLabel] = makeGCMark(syncSetName, res.ResourceID().String())
 		mixin["labels"] = mixinLabels
+	}
+
+	// After loading the manifest the namespace of the resource can change
+	// (e.g. a default namespace is applied)
+	// The `ResourceID` should give us the up-to-date value
+	// (see `KubeManifest.SetNamespace`)
+	namespace, _, _ := res.ResourceID().Components()
+	if namespace != kresource.ClusterScope {
+		mixin["namespace"] = namespace
 	}
 
 	if checksum != "" {
